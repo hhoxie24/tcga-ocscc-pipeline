@@ -1,0 +1,400 @@
+---
+title: "Module 3B: WGCNA Network, Module-Trait Analysis and Enrichment"
+author: "Helen Hoxie"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+**Purpose.** Build a single signed co-expression network over tumor and normal
+adjacent tissue (NAT) samples using the soft-thresholding power recorded in
+`config/runs/<run_id>.json`, then relate module eigengenes to clinical,
+mutation and expression traits and annotate modules by pathway enrichment.
+
+The module stops before network construction if no power is recorded or if the
+input fingerprint differs from the one recorded when the power was chosen
+(Module 3A).
+
+**Trait encoding.**
+
+| Trait | Tumor samples | NAT samples |
+|---|---|---|
+| `Tumor_Status` | 1 | 0 |
+| `Stage_I` ... `Stage_IV` | 1 / 0; `NA` if unstaged | `NA` if `stage_traits_tumor_only`, else 0 |
+| `HPV_Pos` | 1 / 0; `NA` if unknown | `NA` |
+| `<gene>_Mut` (config `mutations$flag_genes`) | 1 / 0; `NA` without mutation data | `NA` |
+| `<gene>_Expr` (config `wgcna$expression_traits`) | log2-CPM | log2-CPM |
+
+Correlation p-values use the number of non-missing samples for each
+module-trait pair (`WGCNA::corAndPvalue`).
+
+**Pathway enrichment** (GO BP, KEGG, Reactome) uses all network genes with an
+Entrez ID as the background (one Entrez ID per Ensembl ID). KEGG and Reactome queries depend on current online
+or package database versions.
+
+**Inputs** (relative to `project_dir`): `data/processed/wgcna_datExpr.rds` (3A),
+`v_mrna.rds`, `gene_annotation.rds` (Module 2), `master_samples.rds` (Module 1);
+`config/runs/<run_id>.json` (repository).
+
+**Outputs:**
+
+| File | Contents |
+|---|---|
+| `data/processed/wgcna_net.rds` | `blockwiseModules` result |
+| `data/processed/wgcna_MEs.rds` | module eigengenes (samples x modules) |
+| `data/processed/wgcna_geneMap.rds` | Ensembl ID, symbol, module, kME |
+| `data/processed/wgcna_traits.rds` | trait matrix |
+| `results/WGCNA/run_snapshot.json` | resolved config and run record used |
+| `results/WGCNA/module_trait_correlations.csv` | r, p, n per module-trait pair |
+| `results/WGCNA/Trait_Heatmap.pdf`, `Trait_Heatmap_Key.pdf` | module-trait heatmaps |
+| `results/WGCNA/Stage_Trajectories.pdf` | eigengenes, Normal through Stage IV |
+| `results/WGCNA/HPV_Confounder.pdf`, `HPV_Effect_Sizes.csv` | eigengenes by HPV group |
+| `results/WGCNA/pathways/<module>_*.txt`, `*_GO_Dotplot.pdf` | enrichment results |
+| `results/WGCNA/Hub_genes.csv` | genes with kME above the configured threshold |
+
+**References.** Langfelder & Horvath (2008) BMC Bioinformatics 9:559 (WGCNA).
+
+
+```{r setup}
+source(here::here("scripts", "helpers", "config.R"))
+source(here::here("scripts", "helpers", "run_record.R"))
+cfg <- load_config()
+start_log(cfg, "Module_3B_WGCNA_Network")
+
+suppressPackageStartupMessages({
+  library(WGCNA)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggpubr)
+  library(cowplot)
+  library(org.Hs.eg.db)
+  library(clusterProfiler)
+  library(ReactomePA)
+})
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads(nThreads = cfg$compute$wgcna_threads)
+set.seed(cfg$compute$seed)
+
+wg <- cfg$wgcna
+wgcna_dir <- proj_path(cfg, "results", "WGCNA")
+pathway_dir <- file.path(wgcna_dir, "pathways")
+dir.create(pathway_dir, recursive = TRUE, showWarnings = FALSE)
+out_data <- function(f) proj_path(cfg, "data", "processed", f)
+```
+
+
+## 1. Recorded power and input check
+
+```{r check_run_record}
+datExpr <- readRDS(out_data("wgcna_datExpr.rds"))
+rec <- read_run_record(cfg)
+
+power <- require_selected_power(rec)
+assert_fingerprint(rec, wgcna_fingerprint(datExpr, cfg$de$gene_types))
+
+candidates <- read.csv(file.path(wgcna_dir, "soft_threshold_candidates.csv"))
+cat("Soft-thresholding power:", power, "\n")
+cat("Selected by:", rec$wgcna_power$selected_by, "on", rec$wgcna_power$selected_on, "\n")
+cat("Criterion:", rec$wgcna_power$selection_criterion, "\n")
+cat("Signed R^2 at this power (from 3A):",
+    round(candidates$signed_R2[candidates$power == power], 3), "\n")
+cat("Input fingerprint verified:", ncol(datExpr), "genes x", nrow(datExpr), "samples\n")
+
+jsonlite::write_json(list(config = cfg, run_record = rec),
+                     file.path(wgcna_dir, "run_snapshot.json"),
+                     auto_unbox = TRUE, pretty = TRUE, na = "null", null = "null")
+```
+
+
+## 2. Network construction
+
+```{r network}
+max_block <- if (is_missing(wg$max_block_size)) ncol(datExpr) + 1 else wg$max_block_size
+cat("maxBlockSize:", max_block, "\n")
+
+cor <- WGCNA::cor   # blockwiseModules requires WGCNA's cor
+net <- blockwiseModules(datExpr, power = power,
+                        networkType = wg$network_type, TOMType = "signed",
+                        maxBlockSize = max_block,
+                        minModuleSize = wg$min_module_size,
+                        mergeCutHeight = wg$merge_cut_height,
+                        numericLabels = TRUE, pamRespectsDendro = FALSE,
+                        randomSeed = cfg$compute$seed, verbose = 0)
+cor <- stats::cor
+
+cat("Blocks:", length(unique(net$blocks)), "\n")
+
+# Rename greenyellow before eigengenes so ME, kME and module labels agree
+moduleColors <- labels2colors(net$colors)
+moduleColors[moduleColors == "greenyellow"] <- "chartreuse"
+
+MEs <- orderMEs(moduleEigengenes(datExpr, colors = moduleColors)$eigengenes)
+rownames(MEs) <- rownames(datExpr)
+datKME <- signedKME(datExpr, MEs)
+
+gene_annotation <- readRDS(out_data("gene_annotation.rds"))
+gene_map <- data.frame(Ensembl_ID = colnames(datExpr), Module = moduleColors) %>%
+  dplyr::mutate(kME = datKME[cbind(seq_len(nrow(datKME)),
+                                   match(paste0("kME", Module), colnames(datKME)))]) %>%
+  dplyr::left_join(gene_annotation[, c("Ensembl_ID", "Symbol")], by = "Ensembl_ID") %>%
+  dplyr::select(Ensembl_ID, Symbol, Module, kME) %>%
+  dplyr::arrange(Module, dplyr::desc(kME))
+
+module_sizes <- sort(table(moduleColors), decreasing = TRUE)
+cat("Modules (excluding grey):", sum(names(module_sizes) != "grey"), "\n")
+n_grey <- sum(moduleColors == "grey")
+cat("Grey genes:", n_grey, "of", ncol(datExpr), sprintf("(%.1f%%)", 100 * n_grey / ncol(datExpr)), "\n")
+print(module_sizes)
+
+saveRDS(net, out_data("wgcna_net.rds"))
+saveRDS(MEs, out_data("wgcna_MEs.rds"))
+saveRDS(gene_map, out_data("wgcna_geneMap.rds"))
+```
+
+
+## 3. Trait matrix
+
+```{r trait_matrix}
+master_samples <- readRDS(out_data("master_samples.rds"))
+ms <- master_samples[match(rownames(datExpr), master_samples$barcode), ]
+stopifnot(identical(ms$barcode, rownames(datExpr)))
+
+is_tumor <- ms$sample_group == "Tumor"
+stage_trait <- function(stage) {
+  x <- as.numeric(ms$Stage_Grouped == stage)          # NA for unstaged tumors
+  x[!is_tumor] <- if (isTRUE(wg$stage_traits_tumor_only)) NA else 0
+  x
+}
+
+traits <- data.frame(
+  Tumor_Status = as.numeric(is_tumor),
+  Stage_I      = stage_trait("Stage I"),
+  Stage_II     = stage_trait("Stage II"),
+  Stage_III    = stage_trait("Stage III"),
+  Stage_IV     = stage_trait("Stage IV"),
+  HPV_Pos      = as.numeric(ms$Final_HPV_Status == "Positive"),   # NA for NAT (Module 1)
+  row.names    = ms$barcode
+)
+
+# Mutation flags: NA for NAT and for tumors without mutation data (Module 1)
+for (g in cfg$mutations$flag_genes) {
+  traits[[paste0(g, "_Mut")]] <- as.numeric(ms[[paste0(g, "_mutant")]])
+}
+
+# Expression traits from the full Module 2 matrix (not limited to network genes)
+expr_all <- readRDS(out_data("v_mrna.rds"))$E
+for (sym in wg$expression_traits) {
+  ens <- gene_annotation$Ensembl_ID[gene_annotation$Symbol == sym]
+  if (length(ens) != 1) stop("Expression trait ", sym, " maps to ", length(ens), " Ensembl IDs.")
+  if (!ens %in% rownames(expr_all)) stop("Expression trait ", sym, " (", ens,
+                                         ") did not pass filterByExpr in Module 2.")
+  traits[[paste0(sym, "_Expr")]] <- expr_all[ens, rownames(datExpr)]
+  cat(sym, "(", ens, ") in network gene set:", ens %in% colnames(datExpr), "\n")
+}
+rm(expr_all)
+
+cat("\nTrait matrix:", nrow(traits), "samples x", ncol(traits), "traits\n")
+cat("Non-missing samples per trait:\n")
+print(colSums(!is.na(traits)))
+saveRDS(traits, out_data("wgcna_traits.rds"))
+```
+
+
+## 4. Module-trait correlations
+
+```{r trait_heatmap}
+cp <- corAndPvalue(MEs, traits, use = "pairwise.complete.obs")
+
+mt_long <- data.frame(
+  Module = rep(rownames(cp$cor), times = ncol(cp$cor)),
+  Trait  = rep(colnames(cp$cor), each = nrow(cp$cor)),
+  r      = as.vector(cp$cor),
+  p      = as.vector(cp$p),
+  n      = as.vector(cp$nObs)
+)
+write.csv(mt_long, file.path(wgcna_dir, "module_trait_correlations.csv"), row.names = FALSE)
+
+draw_trait_heatmap <- function(trait_cols, main) {
+  r <- cp$cor[, trait_cols, drop = FALSE]
+  p <- cp$p[, trait_cols, drop = FALSE]
+  text_mat <- matrix(paste0(signif(r, 2), "\n(", signif(p, 1), ")"), nrow = nrow(r))
+  par(mar = c(10, 10, 4, 3))
+  labeledHeatmap(Matrix = r, xLabels = trait_cols, yLabels = rownames(r),
+                 ySymbols = rownames(r), colorLabels = FALSE,
+                 colors = blueWhiteRed(50), textMatrix = text_mat,
+                 setStdMargins = FALSE, cex.text = 0.6, cex.lab = 0.9,
+                 zlim = c(-1, 1), main = main)
+}
+
+n_text <- sprintf("%d samples (%d tumor, %d NAT); n per trait in module_trait_correlations.csv",
+                  nrow(traits), sum(is_tumor), sum(!is_tumor))
+
+pdf(file.path(wgcna_dir, "Trait_Heatmap.pdf"), width = max(10, 0.8 * ncol(traits) + 4), height = 11)
+draw_trait_heatmap(colnames(traits), paste("Module-trait correlations:", n_text))
+invisible(dev.off())
+
+key_traits <- c("Tumor_Status", "Stage_I", "Stage_II", "Stage_III", "Stage_IV",
+                paste0(wg$expression_traits, "_Expr"))
+pdf(file.path(wgcna_dir, "Trait_Heatmap_Key.pdf"), width = 10, height = 11)
+draw_trait_heatmap(key_traits, "Module-trait correlations (key traits)")
+invisible(dev.off())
+draw_trait_heatmap(key_traits, "Module-trait correlations (key traits)")
+```
+
+
+## 5. Eigengene trajectories (Normal through Stage IV)
+
+Wilcoxon p-values (Normal vs Stage I; Stage I vs Stage IV) are uncorrected and
+descriptive.
+
+```{r trajectories}
+stage_levels <- c("Normal", "Stage I", "Stage II", "Stage III", "Stage IV")
+plot_data <- data.frame(MEs, Barcode = rownames(MEs), check.names = FALSE) %>%
+  dplyr::mutate(Group = ifelse(is_tumor, ms$Stage_Grouped, "Normal")) %>%
+  dplyr::filter(!is.na(Group)) %>%
+  dplyr::mutate(Group = factor(Group, levels = stage_levels))
+n_counts <- plot_data %>% dplyr::count(Group) %>%
+  dplyr::mutate(Label = paste0(Group, "\n(n=", n, ")"))
+plot_data <- plot_data %>%
+  dplyr::left_join(n_counts[, c("Group", "Label")], by = "Group") %>%
+  dplyr::mutate(Label = factor(Label, levels = n_counts$Label))
+comparisons_traj <- list(levels(plot_data$Label)[c(1, 2)], levels(plot_data$Label)[c(2, 5)])
+
+dark_modules <- c("blue", "black", "brown", "red", "magenta", "purple", "green",
+                  "midnightblue", "turquoise", "darkred", "darkgreen", "darkblue")
+plot_list <- lapply(colnames(MEs), function(me) {
+  col <- sub("^ME", "", me)
+  ggplot(dplyr::mutate(plot_data, ModuleLabel = me), aes(x = Label, y = .data[[me]], fill = Label)) +
+    geom_boxplot(outlier.size = 0.5, width = 0.6) +
+    stat_summary(fun = median, geom = "line", aes(group = 1), color = "black") +
+    stat_compare_means(comparisons = comparisons_traj, label = "p.signif",
+                       method = "wilcox.test", vjust = 0.5) +
+    scale_fill_manual(values = c("grey80", "#FDDBC7", "#F4A582", "#D6604D", "#B2182B")) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "none", axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 9, face = "bold"),
+          axis.title.y = element_text(size = 10, face = "bold"),
+          strip.background = element_rect(fill = col),
+          strip.text = element_text(color = if (col %in% dark_modules) "white" else "black",
+                                    face = "bold", size = 11)) +
+    labs(y = "Eigengene") +
+    facet_wrap(~ ModuleLabel)
+})
+pdf(file.path(wgcna_dir, "Stage_Trajectories.pdf"), width = 18,
+    height = 4 * ceiling(length(plot_list) / 4))
+print(plot_grid(plotlist = plot_list, ncol = 4))
+invisible(dev.off())
+```
+
+
+## 6. HPV confounder check
+
+Wilcoxon p-values are uncorrected and descriptive.
+
+```{r hpv_confounder}
+hpv_long <- data.frame(MEs, check.names = FALSE) %>%
+  dplyr::mutate(HPV_Group = dplyr::case_when(
+    !is_tumor                          ~ "Normal",
+    ms$Final_HPV_Status == "Negative"  ~ "Tumor (HPV-)",
+    ms$Final_HPV_Status == "Positive"  ~ "Tumor (HPV+)",
+    TRUE ~ NA_character_)) %>%
+  dplyr::filter(!is.na(HPV_Group)) %>%
+  dplyr::mutate(HPV_Group = factor(HPV_Group, levels = c("Normal", "Tumor (HPV-)", "Tumor (HPV+)"))) %>%
+  tidyr::pivot_longer(cols = dplyr::starts_with("ME"), names_to = "Module", values_to = "Eigengene")
+
+cat("Samples per HPV group:\n")
+print(table(hpv_long$HPV_Group) / ncol(MEs))
+
+p_hpv <- ggplot(hpv_long, aes(x = HPV_Group, y = Eigengene, fill = HPV_Group)) +
+  geom_boxplot(outlier.size = 0.5, width = 0.6) +
+  stat_compare_means(comparisons = list(c("Normal", "Tumor (HPV-)"), c("Normal", "Tumor (HPV+)"),
+                                        c("Tumor (HPV-)", "Tumor (HPV+)")),
+                     label = "p.signif", method = "wilcox.test", size = 3) +
+  facet_wrap(~ Module, scales = "free_y") +
+  scale_fill_manual(values = c("Normal" = "grey80", "Tumor (HPV-)" = "#E66101",
+                               "Tumor (HPV+)" = "#5E3C99")) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top", axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 9, face = "bold"),
+        strip.text = element_text(face = "bold")) +
+  labs(title = "Module eigengenes by HPV status", y = "Eigengene")
+pdf(file.path(wgcna_dir, "HPV_Confounder.pdf"), width = 18, height = 16)
+print(p_hpv)
+invisible(dev.off())
+
+hpv_effect <- hpv_long %>%
+  dplyr::group_by(Module, HPV_Group) %>%
+  dplyr::summarise(Median_ME = median(Eigengene), n = dplyr::n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = HPV_Group, values_from = c(Median_ME, n))
+write.csv(hpv_effect, file.path(wgcna_dir, "HPV_Effect_Sizes.csv"), row.names = FALSE)
+```
+
+
+## 7. Pathway enrichment per module
+
+```{r pathways}
+entrez_all <- suppressMessages(suppressWarnings(
+  bitr(gene_map$Ensembl_ID, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)))
+# One Entrez ID per Ensembl ID (first match), so no gene is counted twice
+n_multi <- sum(table(entrez_all$ENSEMBL) > 1)
+entrez_map <- entrez_all[!duplicated(entrez_all$ENSEMBL), ]
+cat("Ensembl IDs with >1 Entrez match (first kept):", n_multi, "\n")
+universe <- unique(entrez_map$ENTREZID)
+cat("Background: ", length(universe), " Entrez IDs from ",
+    dplyr::n_distinct(entrez_map$ENSEMBL), " of ", nrow(gene_map), " network genes\n", sep = "")
+
+enrich_summary <- list()
+for (mod in setdiff(unique(gene_map$Module), "grey")) {
+  mod_ens <- gene_map$Ensembl_ID[gene_map$Module == mod]
+  entrez <- unique(entrez_map$ENTREZID[entrez_map$ENSEMBL %in% mod_ens])
+  if (length(entrez) == 0) next
+
+  ego <- enrichGO(gene = entrez, universe = universe, OrgDb = org.Hs.eg.db,
+                  ont = "BP", pAdjustMethod = "BH", readable = TRUE)
+  ekegg <- tryCatch(enrichKEGG(gene = entrez, universe = universe, organism = "hsa"),
+                    error = function(e) { message("KEGG failed for ", mod, ": ", conditionMessage(e)); NULL })
+  ereact <- tryCatch(enrichPathway(gene = entrez, universe = universe, organism = "human", readable = TRUE),
+                     error = function(e) { message("Reactome failed for ", mod, ": ", conditionMessage(e)); NULL })
+
+  n_terms <- function(x) if (is.null(x)) NA_integer_ else nrow(as.data.frame(x))
+  enrich_summary[[mod]] <- data.frame(Module = mod, Genes = length(mod_ens), Entrez = length(entrez),
+                                      GO_BP = n_terms(ego), KEGG = n_terms(ekegg), Reactome = n_terms(ereact))
+
+  for (res in list(list(ego, "GO_BP"), list(ekegg, "KEGG"), list(ereact, "Reactome"))) {
+    if (!is.null(res[[1]]) && nrow(as.data.frame(res[[1]])) > 0) {
+      write.table(as.data.frame(res[[1]]), file.path(pathway_dir, paste0(mod, "_", res[[2]], ".txt")),
+                  sep = "\t", quote = FALSE, row.names = FALSE)
+    }
+  }
+  if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+    pdf(file.path(pathway_dir, paste0(mod, "_GO_Dotplot.pdf")), width = 12, height = 10)
+    print(dotplot(ego, showCategory = 10) + ggtitle(paste(mod, "module: GO BP")) +
+            theme(axis.text = element_text(size = 12), plot.title = element_text(size = 14, face = "bold")))
+    invisible(dev.off())
+  }
+}
+cat("\nSignificant terms per module (BH-adjusted, clusterProfiler defaults):\n")
+print(dplyr::bind_rows(enrich_summary), row.names = FALSE)
+```
+
+
+## 8. Hub genes
+
+```{r hubs}
+hub_threshold <- wg$hub_kme_threshold
+hubs <- gene_map %>%
+  dplyr::filter(Module != "grey", kME > hub_threshold) %>%
+  dplyr::mutate(kME_threshold = hub_threshold) %>%
+  dplyr::arrange(Module, dplyr::desc(kME))
+write.csv(hubs, file.path(wgcna_dir, "Hub_genes.csv"), row.names = FALSE)
+cat("Hub genes (kME >", hub_threshold, "):", nrow(hubs), "across",
+    dplyr::n_distinct(hubs$Module), "modules\n")
+print(table(hubs$Module))
+```
+
+
+```{r cleanup_and_session_info}
+rm(datKME, cp, mt_long, plot_data, plot_list, hpv_long, p_hpv, entrez_all, entrez_map, enrich_summary)
+invisible(gc())
+stop_log()
+```

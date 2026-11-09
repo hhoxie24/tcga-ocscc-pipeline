@@ -1,0 +1,35 @@
+# Machine-local configuration (real paths)
+config/config_local.json
+
+# Data, results and logs live in project_dir, outside the repo
+data/
+results/
+logs/
+*.log
+*.rds
+*.RData
+*.rda
+
+# Externally licensed input (download from the source publication; see README)
+HPV_summary*.txt
+
+# Knit outputs
+*.html
+
+# Local assistant files
+CLAUDE.md
+.claude/
+
+# R / RStudio
+.Rhistory
+.Rapp.history
+.Ruserdata
+.Rproj.user/
+renv/library/
+renv/staging/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

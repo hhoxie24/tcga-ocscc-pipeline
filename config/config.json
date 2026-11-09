@@ -1,0 +1,82 @@
+{
+  "run_id": "ocscc_264",
+  "paths": {
+    "project_dir": "/path/to/project"
+  },
+  "compute": {
+    "seed": 123,
+    "wgcna_threads": 4
+  },
+  "mutations": {
+    "flag_genes": [
+      "TP53",
+      "CDKN2A",
+      "FAT1",
+      "NOTCH1",
+      "PIK3CA",
+      "CASP8",
+      "NSD1",
+      "HRAS",
+      "TTN",
+      "MUC16"
+    ],
+    "nonsynonymous_classes": [
+      "Frame_Shift_Del",
+      "Frame_Shift_Ins",
+      "Splice_Site",
+      "Translation_Start_Site",
+      "Nonsense_Mutation",
+      "Nonstop_Mutation",
+      "In_Frame_Del",
+      "In_Frame_Ins",
+      "Missense_Mutation"
+    ]
+  },
+  "de": {
+    "adj_p": 0.05,
+    "abs_logfc": 1,
+    "gene_types": [
+      "protein_coding"
+    ]
+  },
+  "mirna": {
+    "mirbase_version": "v21",
+    "target_table": "mirtarbase",
+    "support_types": [
+      "Functional MTI"
+    ]
+  },
+  "wgcna": {
+    "top_n_by_variance": 10000,
+    "network_type": "signed",
+    "min_module_size": 30,
+    "merge_cut_height": 0.25,
+    "max_block_size": null,
+    "hub_kme_threshold": 0.8,
+    "stage_traits_tumor_only": true,
+    "expression_traits": [
+      "RARG"
+    ],
+    "soft_power": {
+      "candidate_range": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20
+      ],
+      "r2_threshold": 0.85,
+      "selection_criterion": "smallest power at which signed scale-free topology R^2 exceeds r2_threshold, read from the diagnostic plot"
+    }
+  }
+}

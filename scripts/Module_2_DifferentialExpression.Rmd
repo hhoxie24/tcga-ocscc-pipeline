@@ -1,0 +1,389 @@
+---
+title: "Module 2: Differential Expression (mRNA + miRNA)"
+author: "Helen Hoxie"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+**Purpose.** Differential expression with limma-voom
+(`DGEList -> filterByExpr -> calcNormFactors (TMM) -> voom -> lmFit -> eBayes`):
+
+1. mRNA, Tumor vs Normal (NAT)
+2. mRNA, Late (III/IV) vs Early (I/II) stage, tumors only
+3. mRNA, Stage IV vs Stage I, tumors only
+4. miRNA, Tumor vs Normal (NAT)
+5. Validated miRNA-mRNA target pairs with opposite direction of change (multiMiR)
+
+Tumor vs Normal comparisons include patients contributing both a tumor and a NAT
+sample alongside unpaired tumors. Within-patient correlation is estimated with
+`duplicateCorrelation` (block = patient) and used in `voom` and `lmFit`.
+
+Genes are keyed by Ensembl gene ID (version suffix removed). Gene symbols and
+gene types come from the annotation stored in the GDC count object. Analyses are
+restricted to the gene types listed in `config.json: de$gene_types`
+(default: protein-coding; `null` keeps all genes).
+
+**Inputs** (relative to `project_dir`): `data/processed/rna_ocscc_se.rds`,
+`mirna_ocscc_counts.rds` (Module 0); `master_samples.rds`,
+`mirna_sample_map.rds` (Module 1).
+
+**Outputs:**
+
+| File | Contents |
+|---|---|
+| `data/processed/gene_annotation.rds` | Ensembl ID, symbol, gene type for analysed genes |
+| `data/processed/v_mrna.rds`, `res_mrna.rds` | voom object and results, mRNA Tumor vs Normal |
+| `data/processed/v_mrna_LvE.rds`, `res_mrna_LvE.rds` | mRNA Late vs Early |
+| `data/processed/v_mrna_4v1.rds`, `res_mrna_4v1.rds` | mRNA Stage IV vs Stage I |
+| `data/processed/v_mirna.rds`, `res_mirna.rds` | miRNA Tumor vs Normal |
+| `results/DE/*_DE.csv` | full results tables |
+| `results/DE/voom_meanvar_*.pdf`, `volcano_*.pdf` | diagnostic and volcano plots |
+| `results/DE/miRNAup_mRNAdn_targets.txt`, `miRNAdn_mRNAup_targets.txt` | multiMiR target pairs (evidence-level rows) |
+
+**References.** Law et al. (2014) Genome Biology 15:R29 (voom);
+Ritchie et al. (2015) Nucleic Acids Research 43:e47 (limma).
+
+
+```{r setup}
+source(here::here("scripts", "helpers", "config.R"))
+source(here::here("scripts", "helpers", "de_helpers.R"))
+cfg <- load_config()
+start_log(cfg, "Module_2_DifferentialExpression")
+
+suppressPackageStartupMessages({
+  library(SummarizedExperiment)
+  library(edgeR)
+  library(limma)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+adj_p      <- cfg$de$adj_p
+abs_logfc  <- cfg$de$abs_logfc
+gene_types <- cfg$de$gene_types   # NULL = all gene types
+
+de_dir <- proj_path(cfg, "results", "DE")
+dir.create(de_dir, recursive = TRUE, showWarnings = FALSE)
+out_data <- function(f) proj_path(cfg, "data", "processed", f)
+out_res  <- function(f) file.path(de_dir, f)
+
+n_sig <- function(res) sum(res$adj.P.Val < adj_p & abs(res$logFC) > abs_logfc, na.rm = TRUE)
+
+cat("Thresholds: adj.P <", adj_p, "; |logFC| >", abs_logfc, "\n")
+cat("Gene types analysed:", if (is.null(gene_types)) "all" else paste(gene_types, collapse = ", "), "\n")
+```
+
+
+## 1. mRNA counts and gene annotation
+
+```{r load_mrna}
+rna_se <- readRDS(out_data("rna_ocscc_se.rds"))
+master_samples <- readRDS(out_data("master_samples.rds"))
+
+# PAR_Y rows duplicate their chrX counterparts once version suffixes are removed
+is_par_y <- grepl("_PAR_Y", rownames(rna_se))
+cat("Genes in count object:", nrow(rna_se), "\n")
+cat("PAR_Y rows removed:", sum(is_par_y), "\n")
+
+gene_annotation <- as.data.frame(rowData(rna_se)[!is_par_y, c("gene_name", "gene_type")]) %>%
+  dplyr::mutate(Ensembl_ID = sub("\\..*$", "", rownames(rna_se)[!is_par_y])) %>%
+  dplyr::select(Ensembl_ID, Symbol = gene_name, gene_type)
+stopifnot(!anyDuplicated(gene_annotation$Ensembl_ID))
+
+cat("\nGene types (top 8 before filtering):\n")
+print(head(sort(table(gene_annotation$gene_type), decreasing = TRUE), 8))
+
+keep_genes <- if (is.null(gene_types)) rep(TRUE, nrow(gene_annotation)) else gene_annotation$gene_type %in% gene_types
+gene_annotation <- gene_annotation[keep_genes, ]
+cat("\nGenes retained after gene-type filter:", nrow(gene_annotation), "\n")
+cat("Symbols shared by >1 Ensembl ID (Ensembl ID remains the key):",
+    sum(duplicated(gene_annotation$Symbol)), "\n")
+
+counts_mrna <- as.matrix(assay(rna_se, "unstranded")[!is_par_y, ][keep_genes, ])
+rownames(counts_mrna) <- gene_annotation$Ensembl_ID
+
+# Align samples to master_samples (tumor + NAT only)
+stopifnot(all(master_samples$barcode %in% colnames(counts_mrna)))
+counts_mrna <- counts_mrna[, master_samples$barcode]
+cat("mRNA count matrix:", nrow(counts_mrna), "genes x", ncol(counts_mrna), "samples\n")
+
+saveRDS(gene_annotation, out_data("gene_annotation.rds"))
+
+annotate_genes <- function(res) {
+  res %>%
+    dplyr::rename(Ensembl_ID = Feature_ID) %>%
+    dplyr::left_join(gene_annotation, by = "Ensembl_ID")
+}
+
+rm(rna_se, is_par_y, keep_genes)
+invisible(gc())
+```
+
+
+## 2. mRNA: Tumor vs Normal
+
+```{r mrna_tvn}
+de_tvn <- run_voom_de(
+  counts      = counts_mrna,
+  group       = master_samples$sample_group,
+  levels      = c("Normal", "Tumor"),
+  coef_name   = "TumorVsNormal",
+  meanvar_pdf = out_res("voom_meanvar_mRNA.pdf"),
+  block       = master_samples$patient_id
+)
+v_mrna   <- de_tvn$v
+res_mrna <- annotate_genes(de_tvn$res)
+
+cat("Genes tested:", nrow(res_mrna), "| significant:", n_sig(res_mrna), "\n")
+
+saveRDS(v_mrna, out_data("v_mrna.rds"))
+saveRDS(res_mrna, out_data("res_mrna.rds"))
+write.csv(res_mrna, out_res("mRNA_TumorVsNormal_DE.csv"), row.names = FALSE)
+
+p <- plot_volcano(res_mrna, "Symbol", "Up in Tumor", "Down in Tumor",
+                  "mRNA: Tumor vs. Normal (OCSCC)",
+                  sprintf("N = %d Tumor, %d Normal", sum(master_samples$sample_group == "Tumor"),
+                          sum(master_samples$sample_group == "Normal")),
+                  adj_p, abs_logfc, label_n = 20, label_logfc = 2, label_by = "t")
+print(p)
+ggsave(out_res("volcano_mRNA.pdf"), p, width = 10, height = 8)
+```
+
+
+## 3. mRNA: Late vs Early stage (tumors)
+
+```{r mrna_lve}
+samples_lve <- master_samples %>%
+  dplyr::filter(sample_group == "Tumor", Stage_NEL %in% c("Early Stage", "Late Stage"))
+
+de_lve <- run_voom_de(
+  counts      = counts_mrna[, samples_lve$barcode],
+  group       = samples_lve$Stage_NEL,
+  levels      = c("Early Stage", "Late Stage"),
+  coef_name   = "LateVsEarly",
+  meanvar_pdf = out_res("voom_meanvar_mRNA_Late_v_Early.pdf")
+)
+res_mrna_lve <- annotate_genes(de_lve$res)
+cat("Genes tested:", nrow(res_mrna_lve), "| significant:", n_sig(res_mrna_lve), "\n")
+
+saveRDS(de_lve$v, out_data("v_mrna_LvE.rds"))
+saveRDS(res_mrna_lve, out_data("res_mrna_LvE.rds"))
+write.csv(res_mrna_lve, out_res("mRNA_LateStageVsEarlyStage_DE.csv"), row.names = FALSE)
+
+p <- plot_volcano(res_mrna_lve, "Symbol", "Up in Late Stage", "Down in Late Stage",
+                  "mRNA: Late Stage vs. Early Stage (OCSCC)",
+                  sprintf("N = %d Late, %d Early", sum(samples_lve$Stage_NEL == "Late Stage"),
+                          sum(samples_lve$Stage_NEL == "Early Stage")),
+                  adj_p, abs_logfc, label_n = 20, label_logfc = 1, label_by = "t")
+print(p)
+ggsave(out_res("volcano_mRNA_LvE.pdf"), p, width = 10, height = 8)
+rm(de_lve)
+```
+
+
+## 4. mRNA: Stage IV vs Stage I (tumors)
+
+```{r mrna_4v1}
+samples_4v1 <- master_samples %>%
+  dplyr::filter(sample_group == "Tumor", Stage_Grouped %in% c("Stage I", "Stage IV"))
+
+de_4v1 <- run_voom_de(
+  counts      = counts_mrna[, samples_4v1$barcode],
+  group       = samples_4v1$Stage_Grouped,
+  levels      = c("Stage I", "Stage IV"),
+  coef_name   = "StageIVVsStageI",
+  meanvar_pdf = out_res("voom_meanvar_mRNA_StageIV_v_StageI.pdf")
+)
+res_mrna_4v1 <- annotate_genes(de_4v1$res)
+cat("Genes tested:", nrow(res_mrna_4v1), "| significant:", n_sig(res_mrna_4v1), "\n")
+
+saveRDS(de_4v1$v, out_data("v_mrna_4v1.rds"))
+saveRDS(res_mrna_4v1, out_data("res_mrna_4v1.rds"))
+write.csv(res_mrna_4v1, out_res("mRNA_StageIV_Vs_StageI_DE.csv"), row.names = FALSE)
+
+p <- plot_volcano(res_mrna_4v1, "Symbol", "Up in Stage IV", "Down in Stage IV",
+                  "mRNA: Stage IV vs. Stage I (OCSCC)",
+                  sprintf("N = %d Stage IV, %d Stage I", sum(samples_4v1$Stage_Grouped == "Stage IV"),
+                          sum(samples_4v1$Stage_Grouped == "Stage I")),
+                  adj_p, abs_logfc, label_n = 35, label_logfc = 1, label_by = "t")
+print(p)
+ggsave(out_res("volcano_mRNA_4v1.pdf"), p, width = 10, height = 8)
+rm(de_4v1, counts_mrna)
+invisible(gc())
+```
+
+
+## 5. miRNA: Tumor vs Normal
+
+```{r mirna_tvn}
+mirna_counts <- as.matrix(readRDS(out_data("mirna_ocscc_counts.rds")))
+mirna_sample_map <- readRDS(out_data("mirna_sample_map.rds"))
+
+stopifnot(all(mirna_sample_map$barcode %in% colnames(mirna_counts)))
+mirna_counts <- mirna_counts[, mirna_sample_map$barcode]
+cat("miRNA count matrix:", nrow(mirna_counts), "miRNAs x", ncol(mirna_counts), "samples\n")
+
+de_mir <- run_voom_de(
+  counts      = mirna_counts,
+  group       = mirna_sample_map$sample_group,
+  levels      = c("Normal", "Tumor"),
+  coef_name   = "TumorVsNormal",
+  meanvar_pdf = out_res("voom_meanvar_miRNA.pdf"),
+  block       = mirna_sample_map$patient_id
+)
+v_mirna   <- de_mir$v
+res_mirna <- de_mir$res %>% dplyr::rename(miRNA_ID = Feature_ID)
+cat("miRNAs tested:", nrow(res_mirna), "| significant:", n_sig(res_mirna), "\n")
+
+saveRDS(v_mirna, out_data("v_mirna.rds"))
+saveRDS(res_mirna, out_data("res_mirna.rds"))
+write.csv(res_mirna, out_res("miRNA_TumorVsNormal_DE.csv"), row.names = FALSE)
+
+p <- plot_volcano(res_mirna, "miRNA_ID", "Up in Tumor", "Down in Tumor",
+                  "miRNA: Tumor vs. Normal (OCSCC)",
+                  sprintf("N = %d Tumor, %d Normal", sum(mirna_sample_map$sample_group == "Tumor"),
+                          sum(mirna_sample_map$sample_group == "Normal")),
+                  adj_p, abs_logfc, label_n = 20, label_logfc = 1.5, label_by = "p")
+print(p)
+ggsave(out_res("volcano_miRNA.pdf"), p, width = 10, height = 8)
+rm(mirna_counts)
+```
+
+
+## 6. miRNA-mRNA validated target pairs (multiMiR)
+
+GDC miRNA counts are quantified per **precursor** (e.g. `hsa-mir-21`), whereas
+multiMiR stores interactions for **mature** miRNAs (e.g. `hsa-miR-21-5p`). Each
+differentially expressed precursor is mapped to its mature miRNAs with
+miRBaseConverter (miRBase version in `config.json: mirna$mirbase_version`), and
+multiMiR is queried by mature accession (MIMAT). Because precursor-level counts do
+not distinguish the 5p and 3p arms, each precursor is assigned to the validated
+targets of every mature miRNA it produces. Pairs are therefore precursor-level
+candidates, not arm-resolved interactions.
+
+Interactions are restricted to the miRTarBase support categories listed in
+`config.json: mirna$support_types` (default `["Functional MTI"]`). Other
+categories in miRTarBase are `"Functional MTI (Weak)"`, `"Non-Functional MTI"`
+and `"Non-Functional MTI (Weak)"`; some multiMiR rows carry no support category.
+Set `support_types` to `null` to keep all rows. The log reports evidence rows per
+category before filtering.
+
+*Planned for a later version:* use GDC isoform-level (mature) miRNA
+quantification so that DE and target matching are performed per mature miRNA.
+
+```{r multimir}
+suppressPackageStartupMessages({
+  library(multiMiR)
+  library(miRBaseConverter)
+})
+
+mirbase_version <- cfg$mirna$mirbase_version
+cat("miRBase version used for mapping (config):", mirbase_version, "\n")
+cat("Most likely miRBase version of GDC IDs (checkMiRNAVersion):",
+    checkMiRNAVersion(res_mirna$miRNA_ID, verbose = FALSE), "\n")
+cat("\nmultiMiR database:\n")
+print(multimir_dbInfo())
+
+# Precursor -> mature name -> mature accession
+p2m <- miRNA_PrecursorToMature(res_mirna$miRNA_ID, version = mirbase_version)
+colnames(p2m)[1] <- "miRNA_ID"
+mature_map <- p2m %>%
+  tidyr::pivot_longer(-miRNA_ID, values_to = "mature_name") %>%
+  dplyr::filter(!is.na(mature_name), mature_name != "") %>%
+  dplyr::distinct(miRNA_ID, mature_name)
+acc <- miRNA_NameToAccession(unique(mature_map$mature_name), version = mirbase_version)
+colnames(acc) <- c("mature_name", "mature_mirna_acc")
+mature_map <- mature_map %>% dplyr::left_join(acc, by = "mature_name")
+
+cat("\nPrecursors tested:", nrow(res_mirna), "\n")
+cat("Precursors mapped to >= 1 mature miRNA:", dplyr::n_distinct(mature_map$miRNA_ID), "\n")
+cat("Mature miRNAs without accession:", sum(is.na(mature_map$mature_mirna_acc)), "\n")
+mature_map <- dplyr::filter(mature_map, !is.na(mature_mirna_acc))
+
+support_types <- cfg$mirna$support_types   # NULL = all support categories
+cat("\nmiRTarBase support types retained:",
+    if (is.null(support_types)) "all" else paste(support_types, collapse = ", "), "\n")
+
+sig_mirna <- res_mirna %>%
+  dplyr::filter(adj.P.Val < adj_p, abs(logFC) > abs_logfc) %>%
+  dplyr::select(miRNA_ID, logFC_miRNA = logFC, adjP_miRNA = adj.P.Val) %>%
+  dplyr::inner_join(mature_map, by = "miRNA_ID")
+sig_mrna <- res_mrna %>%
+  dplyr::filter(adj.P.Val < adj_p, abs(logFC) > abs_logfc, !is.na(Symbol)) %>%
+  dplyr::select(Ensembl_ID, Symbol, logFC_mRNA = logFC, adjP_mRNA = adj.P.Val)
+
+# Validated pairs for one direction: miRNAs changing in mir_sign, mRNAs in the opposite direction
+query_pairs <- function(mir_sign) {
+  mirs  <- dplyr::filter(sig_mirna, sign(logFC_miRNA) == mir_sign)
+  mrnas <- dplyr::filter(sig_mrna,  sign(logFC_mRNA)  == -mir_sign)
+  cat(sprintf("  precursors: %d (mature: %d) | mRNAs: %d\n",
+              dplyr::n_distinct(mirs$miRNA_ID), nrow(mirs), nrow(mrnas)))
+  if (nrow(mirs) == 0 || nrow(mrnas) == 0) return(NULL)
+  mm <- get_multimir(org = "hsa", mirna = unique(mirs$mature_mirna_acc),
+                     target = unique(mrnas$Symbol), table = cfg$mirna$target_table,
+                     summary = FALSE)
+  evidence <- mm@data %>%
+    dplyr::mutate(support_type = dplyr::if_else(is.na(support_type) | support_type == "",
+                                                "(none)", support_type))
+  cat("  evidence rows by support type (before filter):\n")
+  print(table(evidence$support_type))
+  if (!is.null(support_types)) {
+    evidence <- dplyr::filter(evidence, support_type %in% support_types)
+  }
+  evidence %>%
+    dplyr::inner_join(mirs,  by = "mature_mirna_acc", relationship = "many-to-many") %>%
+    dplyr::inner_join(mrnas, by = c("target_symbol" = "Symbol"), relationship = "many-to-many")
+}
+
+cat("\nmiRNA up x mRNA down:\n")
+pairs_up <- query_pairs(+1)
+cat("miRNA down x mRNA up:\n")
+pairs_dn <- query_pairs(-1)
+
+summarise_pairs <- function(x, label) {
+  if (is.null(x) || nrow(x) == 0) {
+    cat(label, ": 0 evidence rows\n")
+    return(c(rows = 0, precursor_pairs = 0, mature_pairs = 0))
+  }
+  out <- c(rows            = nrow(x),
+           precursor_pairs = nrow(dplyr::distinct(x, miRNA_ID, Ensembl_ID)),
+           mature_pairs    = nrow(dplyr::distinct(x, mature_mirna_acc, Ensembl_ID)))
+  cat(label, ":", out[["rows"]], "evidence rows,", out[["precursor_pairs"]],
+      "unique precursor-target pairs,", out[["mature_pairs"]], "unique mature-target pairs\n")
+  out
+}
+cat("\n")
+sum_up <- summarise_pairs(pairs_up, "miRNA up x mRNA down")
+sum_dn <- summarise_pairs(pairs_dn, "miRNA down x mRNA up")
+
+write.table(if (is.null(pairs_up)) data.frame() else pairs_up,
+            out_res("miRNAup_mRNAdn_targets.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(if (is.null(pairs_dn)) data.frame() else pairs_dn,
+            out_res("miRNAdn_mRNAup_targets.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+
+## 7. Summary
+
+```{r summary_table}
+summary_df <- data.frame(
+  Analysis = c("mRNA Tumor vs Normal", "mRNA Late vs Early", "mRNA Stage IV vs Stage I",
+               "miRNA Tumor vs Normal",
+               "miRNA up x mRNA down (unique precursor-target pairs)",
+               "miRNA down x mRNA up (unique precursor-target pairs)"),
+  N_Tested = c(nrow(res_mrna), nrow(res_mrna_lve), nrow(res_mrna_4v1), nrow(res_mirna), NA, NA),
+  N_Significant = c(n_sig(res_mrna), n_sig(res_mrna_lve), n_sig(res_mrna_4v1), n_sig(res_mirna),
+                    sum_up[["precursor_pairs"]], sum_dn[["precursor_pairs"]]),
+  Within_Patient_Correlation = c(round(de_tvn$consensus, 4), NA, NA, round(de_mir$consensus, 4), NA, NA)
+)
+print(summary_df, row.names = FALSE)
+```
+
+
+```{r cleanup_and_session_info}
+rm(de_tvn, de_mir, p, p2m, acc, mature_map, sig_mirna, sig_mrna, pairs_up, pairs_dn,
+   samples_lve, samples_4v1, res_mrna_lve, res_mrna_4v1)
+invisible(gc())
+stop_log()
+```

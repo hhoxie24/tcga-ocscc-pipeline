@@ -1,0 +1,17 @@
+{
+  "run_id": "ocscc_264",
+  "wgcna_power": {
+    "selected_value": 10,
+    "selected_by": "HH",
+    "selected_on": "2026-11-09",
+    "selection_criterion": "smallest power at which signed scale-free topology R^2 exceeds r2_threshold, read from the diagnostic plot",
+    "r2_threshold": 0.85,
+    "diagnostic_artifact": "results/WGCNA/SoftThreshold.pdf",
+    "input_fingerprint": {
+      "n_samples": 264,
+      "n_genes": 10000,
+      "gene_types": "protein_coding",
+      "digest": "f10e37acd377dfca6322994c0dd9db7d"
+    }
+  }
+}

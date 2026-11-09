@@ -1,0 +1,166 @@
+---
+title: "Module 3A: WGCNA Input and Soft-Threshold Diagnostic"
+author: "Helen Hoxie"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+**Purpose.** Build the WGCNA input matrix and compute the scale-free topology
+diagnostic used to choose the soft-thresholding power. The power is a judgment
+made by a person reading the diagnostic plot; this module does not choose it.
+
+This module stops after the diagnostic. Before running Module 3B:
+
+1. Inspect `results/WGCNA/SoftThreshold.pdf` and `soft_threshold_candidates.csv`.
+2. Record the chosen power, your name and the date in `config/runs/<run_id>.json`
+   (created by this module on first run).
+
+Module 3B refuses to run if no power is recorded, or if the input fingerprint
+in the run record no longer matches the matrix produced here.
+
+**Input.** Expression values (`v_mrna$E`, log2-CPM after `filterByExpr` and TMM)
+from Module 2, restricted to the gene types in `config.json: de$gene_types`.
+voom expression values do not depend on the design matrix, so the Module 2
+object serves as variance-stabilized WGCNA input.
+
+**Outputs** (relative to `project_dir`):
+
+| File | Contents |
+|---|---|
+| `data/processed/wgcna_datExpr.rds` | samples x genes matrix, top genes by variance |
+| `results/WGCNA/SoftThreshold.pdf` | scale-free fit and mean connectivity by power |
+| `results/WGCNA/soft_threshold_candidates.csv` | fit indices per candidate power |
+| `config/runs/<run_id>.json` (repository) | run record, created if absent; never overwritten |
+
+**References.** Langfelder & Horvath (2008) BMC Bioinformatics 9:559 (WGCNA).
+
+
+```{r setup}
+source(here::here("scripts", "helpers", "config.R"))
+source(here::here("scripts", "helpers", "run_record.R"))
+cfg <- load_config()
+start_log(cfg, "Module_3A_WGCNA_Diagnostic")
+
+suppressPackageStartupMessages({
+  library(WGCNA)
+  library(dplyr)
+})
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads(nThreads = cfg$compute$wgcna_threads)
+set.seed(cfg$compute$seed)
+
+wg <- cfg$wgcna
+wgcna_dir <- proj_path(cfg, "results", "WGCNA")
+dir.create(wgcna_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("Run ID:", cfg$run_id, "\n")
+cat("Gene types:", if (is.null(cfg$de$gene_types)) "all" else paste(cfg$de$gene_types, collapse = ", "), "\n")
+cat("Top genes by variance:", wg$top_n_by_variance, "| network type:", wg$network_type, "\n")
+```
+
+
+## 1. Input matrix
+
+```{r input_matrix}
+v_mrna <- readRDS(proj_path(cfg, "data", "processed", "v_mrna.rds"))
+master_samples <- readRDS(proj_path(cfg, "data", "processed", "master_samples.rds"))
+
+expr <- v_mrna$E
+stopifnot(setequal(colnames(expr), master_samples$barcode))
+expr <- expr[, master_samples$barcode]
+cat("Expression matrix from Module 2:", nrow(expr), "genes x", ncol(expr), "samples\n")
+
+gene_var <- apply(expr, 1, var)
+n_top <- min(wg$top_n_by_variance, nrow(expr))
+top_genes <- names(sort(gene_var, decreasing = TRUE))[seq_len(n_top)]
+datExpr <- t(expr[top_genes, ])
+cat("Genes selected (top", n_top, "by variance):", ncol(datExpr), "\n")
+cat("Variance at selection cutoff:", signif(gene_var[top_genes[n_top]], 3), "\n")
+
+gsg <- goodSamplesGenes(datExpr, verbose = 0)
+cat("goodSamplesGenes allOK:", gsg$allOK, "\n")
+stopifnot(gsg$allOK)
+
+saveRDS(datExpr, proj_path(cfg, "data", "processed", "wgcna_datExpr.rds"))
+rm(v_mrna, expr, gene_var, top_genes, gsg)
+invisible(gc())
+```
+
+
+## 2. Soft-threshold diagnostic
+
+```{r soft_threshold}
+powers <- wg$soft_power$candidate_range
+r2_threshold <- wg$soft_power$r2_threshold
+
+sft <- pickSoftThreshold(datExpr, powerVector = powers,
+                         networkType = wg$network_type, verbose = 0)
+
+fit <- sft$fitIndices %>%
+  dplyr::transmute(
+    power        = Power,
+    signed_R2    = -sign(slope) * SFT.R.sq,
+    slope        = slope,
+    mean_k       = mean.k.,
+    median_k     = median.k.,
+    meets_criterion = signed_R2 > r2_threshold
+  )
+write.csv(fit, file.path(wgcna_dir, "soft_threshold_candidates.csv"), row.names = FALSE)
+
+cat("Selection criterion (config):", wg$soft_power$selection_criterion, "\n")
+cat("R^2 threshold:", r2_threshold, "\n\n")
+print(fit %>% dplyr::mutate(dplyr::across(c(signed_R2, slope), ~ round(.x, 3)),
+                            dplyr::across(c(mean_k, median_k), ~ round(.x, 1))),
+      row.names = FALSE)
+
+plot_soft_threshold <- function() {
+  par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+  plot(fit$power, fit$signed_R2, type = "n", ylim = range(c(fit$signed_R2, r2_threshold, 0)),
+       xlab = "Soft threshold (power)", ylab = expression("Scale-free fit, signed " * R^2),
+       main = "Scale independence", cex.lab = 1.3, cex.axis = 1.1, cex.main = 1.3)
+  abline(h = r2_threshold, col = "red", lty = 2)
+  text(fit$power, fit$signed_R2, labels = fit$power, col = "red", cex = 1.1)
+  plot(fit$power, fit$mean_k, type = "n",
+       xlab = "Soft threshold (power)", ylab = "Mean connectivity",
+       main = "Mean connectivity", cex.lab = 1.3, cex.axis = 1.1, cex.main = 1.3)
+  text(fit$power, fit$mean_k, labels = fit$power, col = "red", cex = 1.1)
+}
+pdf(file.path(wgcna_dir, "SoftThreshold.pdf"), width = 11, height = 5.5)
+plot_soft_threshold()
+invisible(dev.off())
+plot_soft_threshold()
+```
+
+
+## 3. Run record
+
+```{r run_record}
+fp <- wgcna_fingerprint(datExpr, cfg$de$gene_types)
+cat("Input fingerprint:\n")
+cat(jsonlite::toJSON(fp, auto_unbox = TRUE, pretty = TRUE), "\n\n")
+
+rec_path <- run_record_path(cfg)
+if (!file.exists(rec_path)) {
+  create_run_record(cfg, fp)
+  cat("Run record created:", rec_path, "\n")
+  cat("Next: fill wgcna_power$selected_value, selected_by and selected_on, then run Module 3B.\n")
+} else {
+  rec <- read_run_record(cfg)
+  if (fingerprints_match(rec$wgcna_power$input_fingerprint, fp)) {
+    cat("Existing run record matches this input. Recorded power:",
+        if (is_missing(rec$wgcna_power$selected_value)) "not yet recorded" else rec$wgcna_power$selected_value, "\n")
+  } else {
+    cat("WARNING: the existing run record was made on a different input.\n",
+        "Its recorded power does not apply to this matrix, and Module 3B will refuse to run.\n",
+        "Re-read the diagnostic, then replace input_fingerprint with the fingerprint above\n",
+        "and update selected_value, selected_by and selected_on.\n")
+  }
+}
+```
+
+
+```{r cleanup_and_session_info}
+rm(datExpr, sft, fit, fp)
+invisible(gc())
+stop_log()
+```

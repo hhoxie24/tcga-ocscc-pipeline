@@ -1,0 +1,226 @@
+---
+title: "Module 1: Master Metadata Construction"
+author: "Helen Hoxie"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+**Purpose.** Build synchronized metadata tables:
+
+1. `master_patient`: one row per OCSCC patient, combining clinical variables, HPV
+   status, mutation burden and per-gene mutation flags.
+2. `master_samples`: one row per mRNA barcode (tumor and normal adjacent tissue,
+   NAT), aligned to count-matrix columns for differential expression and WGCNA.
+3. `mirna_sample_map`: the equivalent table for miRNA barcodes.
+
+Only primary tumor (sample type `01`) and NAT (`11`) samples are retained.
+Tumor-intrinsic attributes (somatic mutation flags, mutation burden, HPV status)
+are defined for tumor samples only and are `NA` for NAT samples. Mutation flags
+and burden count non-synonymous variants only (`config.json: mutations`).
+Patients without mutation data have `NA` flags and burden, not `FALSE`/`0`.
+
+**Inputs** (relative to `project_dir`): `data/processed/clinical_ocscc.rds`,
+`rna_metadata_ocscc.rds`, `mirna_metadata_ocscc.rds`, `OCSCC_Mutation_Details.txt`
+(Module 0); `data/external/HPV_summary_TCGA2015NatureSupp1_2.txt`.
+
+**Outputs:**
+
+| File | Contents |
+|---|---|
+| `data/processed/master_patient.rds` | patient-level metadata |
+| `data/processed/master_samples.rds` | sample-level metadata, mRNA barcodes |
+| `data/processed/mirna_sample_map.rds` | sample-level metadata, miRNA barcodes |
+
+
+```{r setup}
+source(here::here("scripts", "helpers", "config.R"))
+cfg <- load_config()
+start_log(cfg, "Module_1_Metadata")
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+})
+
+flag_genes    <- cfg$mutations$flag_genes
+nonsyn_classes <- cfg$mutations$nonsynonymous_classes
+retained_sample_types <- c(Tumor = "01", Normal = "11")
+
+cat("Mutation flag genes:", paste(flag_genes, collapse = ", "), "\n")
+cat("Non-synonymous classes:", paste(nonsyn_classes, collapse = ", "), "\n")
+```
+
+
+## 1. Patient-level metadata
+
+```{r patient_metadata}
+clinical_ocscc <- readRDS(proj_path(cfg, "data", "processed", "clinical_ocscc.rds"))
+
+hpv_data <- read.table(proj_path(cfg, "data", "external", "HPV_summary_TCGA2015NatureSupp1_2.txt"),
+                       header = TRUE, sep = "\t", stringsAsFactors = FALSE) %>%
+  dplyr::rename(patient_id = Barcode) %>%
+  dplyr::select(patient_id, Final_HPV_Status)
+stopifnot(!anyDuplicated(hpv_data$patient_id))
+
+maf_all <- read.table(proj_path(cfg, "data", "processed", "OCSCC_Mutation_Details.txt"),
+                      header = TRUE, sep = "\t", stringsAsFactors = FALSE,
+                      quote = "", comment.char = "") %>%
+  dplyr::mutate(patient_id       = substr(Tumor_Sample_Barcode, 1, 12),
+                sample_type_code = substr(Tumor_Sample_Barcode, 14, 15))
+
+# Mutation calls from primary tumors only (same sample-type rule as the RNA tables)
+excluded_maf <- maf_all %>% dplyr::filter(sample_type_code != retained_sample_types[["Tumor"]])
+cat("Excluded MAF tumor barcodes (sample type not 01):\n")
+print(dplyr::count(excluded_maf, Tumor_Sample_Barcode, name = "n_variants"), row.names = FALSE)
+
+maf_details <- maf_all %>% dplyr::filter(sample_type_code == retained_sample_types[["Tumor"]])
+stopifnot(!anyDuplicated(unique(maf_details[, c("patient_id", "Tumor_Sample_Barcode")])$patient_id))
+
+# A patient has mutation data if any variant of any class was called
+patients_with_maf <- unique(maf_details$patient_id)
+
+maf_nonsyn <- maf_details %>% dplyr::filter(Variant_Classification %in% nonsyn_classes)
+
+cat("Variants in MAF (all tumor barcodes):", nrow(maf_all), "\n")
+cat("Variants from primary tumors:", nrow(maf_details), "\n")
+cat("Non-synonymous variants retained:", nrow(maf_nonsyn), "\n")
+cat("Patients with mutation data:", length(patients_with_maf), "\n")
+
+# Non-synonymous mutation burden and LoF genes per patient
+patient_mut_summary <- maf_nonsyn %>%
+  dplyr::group_by(patient_id) %>%
+  dplyr::summarise(
+    Mutation_Burden = dplyr::n(),
+    LoF_Genes = paste(unique(Hugo_Symbol[Mutation_Type == "LoF"]), collapse = "; "),
+    .groups = "drop"
+  )
+
+# Per-gene flags: TRUE if the patient carries >= 1 non-synonymous variant in the gene
+driver_status <- maf_nonsyn %>%
+  dplyr::filter(Hugo_Symbol %in% flag_genes) %>%
+  dplyr::distinct(patient_id, Hugo_Symbol) %>%
+  dplyr::mutate(mutated = TRUE) %>%
+  tidyr::pivot_wider(names_from = Hugo_Symbol, values_from = mutated, values_fill = FALSE)
+for (g in setdiff(flag_genes, colnames(driver_status))) driver_status[[g]] <- FALSE
+driver_status <- driver_status %>%
+  dplyr::rename_with(~ paste0(.x, "_mutant"), .cols = dplyr::all_of(flag_genes))
+
+master_patient <- clinical_ocscc %>%
+  dplyr::rename(patient_id = submitter_id) %>%
+  dplyr::left_join(hpv_data, by = "patient_id") %>%
+  dplyr::mutate(Has_Mutation_Data = patient_id %in% patients_with_maf) %>%
+  dplyr::left_join(patient_mut_summary, by = "patient_id") %>%
+  dplyr::left_join(driver_status, by = "patient_id") %>%
+  # Absence of a variant means wild-type only for patients with mutation data
+  dplyr::mutate(
+    Mutation_Burden = ifelse(Has_Mutation_Data, tidyr::replace_na(Mutation_Burden, 0L), NA_integer_),
+    dplyr::across(dplyr::ends_with("_mutant"),
+                  ~ ifelse(Has_Mutation_Data, tidyr::replace_na(.x, FALSE), NA))
+  ) %>%
+  # Collapse IVA/IVB/IVC into Stage IV; unstaged stays NA
+  dplyr::mutate(
+    Stage_Grouped = dplyr::case_when(
+      ajcc_pathologic_stage == "Stage I"       ~ "Stage I",
+      ajcc_pathologic_stage == "Stage II"      ~ "Stage II",
+      ajcc_pathologic_stage == "Stage III"     ~ "Stage III",
+      grepl("^Stage IV", ajcc_pathologic_stage) ~ "Stage IV",
+      TRUE ~ NA_character_
+    )
+  )
+
+stopifnot(nrow(master_patient) == nrow(clinical_ocscc))
+stopifnot(!anyDuplicated(master_patient$patient_id))
+
+cat("=== Patient-Level Metadata ===\n")
+cat("Patients:", nrow(master_patient), "\n")
+cat("With mutation data:", sum(master_patient$Has_Mutation_Data), "\n")
+cat("\nHPV status:\n")
+print(table(master_patient$Final_HPV_Status, useNA = "ifany"))
+cat("\nMutation flags (TRUE / FALSE / NA):\n")
+for (g in paste0(flag_genes, "_mutant")) {
+  x <- master_patient[[g]]
+  cat(sprintf("  %-14s %4d / %4d / %4d\n", g,
+              sum(x, na.rm = TRUE), sum(!x, na.rm = TRUE), sum(is.na(x))))
+}
+cat("\nStage distribution:\n")
+print(table(master_patient$Stage_Grouped, useNA = "ifany"))
+
+saveRDS(master_patient, proj_path(cfg, "data", "processed", "master_patient.rds"))
+```
+
+
+## 2. Sample-level metadata (mRNA)
+
+```{r sample_metadata}
+rna_meta <- readRDS(proj_path(cfg, "data", "processed", "rna_metadata_ocscc.rds"))
+
+tumor_intrinsic_cols <- c("Final_HPV_Status", "Mutation_Burden", "LoF_Genes",
+                          paste0(flag_genes, "_mutant"))
+
+excluded_rna <- rna_meta %>% dplyr::filter(!sample_type_code %in% retained_sample_types)
+cat("Excluded mRNA samples (sample type not 01/11):", nrow(excluded_rna), "\n")
+if (nrow(excluded_rna) > 0) print(excluded_rna[, c("barcode", "sample_type_code")], row.names = FALSE)
+
+master_samples <- rna_meta %>%
+  dplyr::select(barcode, patient_id, sample_type_code) %>%
+  dplyr::filter(sample_type_code %in% retained_sample_types) %>%
+  dplyr::mutate(sample_group = names(retained_sample_types)[match(sample_type_code, retained_sample_types)]) %>%
+  dplyr::left_join(master_patient, by = "patient_id") %>%
+  dplyr::mutate(
+    dplyr::across(dplyr::all_of(tumor_intrinsic_cols), ~ replace(.x, sample_group != "Tumor", NA)),
+    Stage_NEL = dplyr::case_when(
+      sample_group == "Normal"                          ~ "Normal",
+      Stage_Grouped %in% c("Stage I", "Stage II")       ~ "Early Stage",
+      Stage_Grouped %in% c("Stage III", "Stage IV")     ~ "Late Stage",
+      TRUE ~ NA_character_
+    )
+  )
+
+# No row inflation from the patient join
+stopifnot(nrow(master_samples) == nrow(rna_meta) - nrow(excluded_rna))
+
+cat("=== Sample-Level Metadata (mRNA) ===\n")
+cat("Samples:", nrow(master_samples), "\n")
+print(table(master_samples$sample_group))
+cat("\nNormal / Early / Late:\n")
+print(table(master_samples$Stage_NEL, useNA = "ifany"))
+cat("\nHPV status by sample group:\n")
+print(table(master_samples$sample_group, master_samples$Final_HPV_Status, useNA = "ifany"))
+
+saveRDS(master_samples, proj_path(cfg, "data", "processed", "master_samples.rds"))
+```
+
+
+## 3. Sample-level metadata (miRNA)
+
+```{r mirna_sample_map}
+mirna_meta <- readRDS(proj_path(cfg, "data", "processed", "mirna_metadata_ocscc.rds"))
+
+excluded_mirna <- mirna_meta %>% dplyr::filter(!sample_type_code %in% retained_sample_types)
+cat("Excluded miRNA samples (sample type not 01/11):", nrow(excluded_mirna), "\n")
+if (nrow(excluded_mirna) > 0) print(excluded_mirna[, c("barcode", "sample_type_code")], row.names = FALSE)
+
+mirna_sample_map <- mirna_meta %>%
+  dplyr::select(barcode, patient_id, sample_type_code) %>%
+  dplyr::filter(sample_type_code %in% retained_sample_types) %>%
+  dplyr::mutate(sample_group = names(retained_sample_types)[match(sample_type_code, retained_sample_types)]) %>%
+  dplyr::left_join(master_patient %>% dplyr::select(patient_id, Final_HPV_Status, Stage_Grouped),
+                   by = "patient_id") %>%
+  dplyr::mutate(Final_HPV_Status = replace(Final_HPV_Status, sample_group != "Tumor", NA))
+
+stopifnot(nrow(mirna_sample_map) == nrow(mirna_meta) - nrow(excluded_mirna))
+
+cat("=== Sample-Level Metadata (miRNA) ===\n")
+cat("Samples:", nrow(mirna_sample_map), "\n")
+print(table(mirna_sample_map$sample_group))
+
+saveRDS(mirna_sample_map, proj_path(cfg, "data", "processed", "mirna_sample_map.rds"))
+```
+
+
+```{r cleanup_and_session_info}
+rm(clinical_ocscc, hpv_data, maf_all, excluded_maf, maf_details, maf_nonsyn, patient_mut_summary, driver_status,
+   rna_meta, mirna_meta, excluded_rna, excluded_mirna)
+invisible(gc())
+stop_log()
+```

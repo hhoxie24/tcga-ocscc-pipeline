@@ -1,0 +1,284 @@
+---
+title: "Module 0: Data Acquisition"
+author: "Helen Hoxie"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+**Purpose.** Download TCGA-HNSC clinical, mRNA (STAR counts), miRNA and masked
+somatic mutation data from the GDC, and restrict every layer to oral cavity
+squamous cell carcinoma (OCSCC) patients, selected by tissue/organ of origin.
+Each layer is downloaded only if its processed output is absent from
+`data/processed/`; reused files are reported in the log.
+
+**Inputs.** GDC API (TCGAbiolinks); `config/config.json`;
+`data/external/HPV_summary_TCGA2015NatureSupp1_2.txt` (user-supplied; see README).
+
+**Outputs** (relative to `project_dir`):
+
+| File | Contents |
+|---|---|
+| `data/raw/GDCdata/` | GDC downloads |
+| `data/processed/clinical_ocscc.rds` | clinical table, one row per OCSCC patient |
+| `data/processed/rna_ocscc_se.rds` | SummarizedExperiment, STAR counts |
+| `data/processed/rna_metadata_ocscc.rds` | barcode-to-patient map (mRNA) |
+| `data/processed/mirna_ocscc_counts.rds` | miRNA count matrix (miRNA x barcode) |
+| `data/processed/mirna_metadata_ocscc.rds` | barcode-to-patient map (miRNA) |
+| `data/processed/OCSCC_Mutation_Details.txt` | mutation table with LoF class |
+
+The clinical table defines the cohort. Each omics layer contains a subset of
+these patients; layers differ in which patients they include, and some patients
+contribute a normal adjacent tissue (NAT) sample in addition to the tumor.
+
+
+```{r setup}
+source(here::here("scripts", "helpers", "config.R"))
+cfg <- load_config()
+start_log(cfg, "Module_0_DataAcquisition")
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(SummarizedExperiment)
+  library(TCGAbiolinks)
+  library(maftools)
+})
+
+gdc_dir <- proj_path(cfg, "data", "raw")
+```
+
+
+```{r gdc_release}
+# GDC data release at run time. Applies to any layer downloaded in this run;
+# layers reused from data/processed/ may come from an earlier release.
+gdc_info <- tryCatch(getGDCInfo(), error = function(e) NULL)
+if (is.null(gdc_info)) {
+  cat("GDC API not reachable: data release not recorded.\n")
+} else {
+  cat("GDC data release at run time:", gdc_info$data_release, "\n")
+}
+```
+
+
+## 1. Clinical data and OCSCC cohort definition
+
+```{r clinical}
+# ICD-O-3 site labels as reported in GDC tissue_or_organ_of_origin.
+# The list includes lip and mandible sites (see README, Cohort definition).
+oral_cavity_sites <- c(
+  "Tongue, NOS", "Border of tongue", "Ventral surface of tongue, NOS",
+  "Floor of mouth, NOS", "Anterior floor of mouth", "Gum, NOS",
+  "Lower gum", "Upper Gum", "Hard palate", "Palate, NOS",
+  "Cheek mucosa", "Lip, NOS", "Retromolar area", "Mouth, NOS", "Mandible"
+)
+
+clinical_file <- proj_path(cfg, "data", "processed", "clinical_ocscc.rds")
+
+if (file.exists(clinical_file)) {
+  note_existing(clinical_file)
+  clinical_ocscc <- readRDS(clinical_file)
+} else {
+  clinical_hnsc <- GDCquery_clinic(project = "TCGA-HNSC", type = "clinical")
+  clinical_ocscc <- clinical_hnsc %>%
+    filter(tissue_or_organ_of_origin %in% oral_cavity_sites)
+  saveRDS(clinical_ocscc, clinical_file)
+  rm(clinical_hnsc)
+}
+
+# One row per patient is required downstream
+stopifnot(!anyDuplicated(clinical_ocscc$submitter_id))
+ocscc_patient_ids <- clinical_ocscc$submitter_id
+
+cat("=== Clinical Data ===\n")
+cat("Patients:", length(ocscc_patient_ids), "\n")
+cat("\nAnatomical sites:\n")
+print(table(clinical_ocscc$tissue_or_organ_of_origin))
+cat("\nStage distribution:\n")
+print(table(clinical_ocscc$ajcc_pathologic_stage, useNA = "ifany"))
+```
+
+
+## 2. mRNA-seq (STAR counts)
+
+```{r mrna}
+rna_se_file   <- proj_path(cfg, "data", "processed", "rna_ocscc_se.rds")
+rna_meta_file <- proj_path(cfg, "data", "processed", "rna_metadata_ocscc.rds")
+
+if (all(file.exists(c(rna_se_file, rna_meta_file)))) {
+  note_existing(c(rna_se_file, rna_meta_file))
+  rna_se   <- readRDS(rna_se_file)
+  rna_meta <- readRDS(rna_meta_file)
+} else {
+  query_rna <- GDCquery(
+    project       = "TCGA-HNSC",
+    data.category = "Transcriptome Profiling",
+    data.type     = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts"
+  )
+  query_rna$results[[1]] <- query_rna$results[[1]] %>%
+    filter(substr(cases, 1, 12) %in% ocscc_patient_ids)
+
+  GDCdownload(query_rna, directory = gdc_dir, method = "api")
+  rna_data <- GDCprepare(query = query_rna, directory = gdc_dir)
+
+  rna_meta <- as.data.frame(colData(rna_data))
+  rna_meta$barcode          <- rownames(rna_meta)
+  rna_meta$patient_id       <- substr(rna_meta$barcode, 1, 12)
+  rna_meta$sample_type_code <- substr(rna_meta$barcode, 14, 15)
+  rna_meta <- rna_meta %>% filter(patient_id %in% ocscc_patient_ids)
+
+  rna_se <- rna_data[, rna_meta$barcode]
+
+  saveRDS(rna_se, rna_se_file)
+  saveRDS(rna_meta, rna_meta_file)
+  rm(query_rna, rna_data)
+}
+
+stopifnot(all(c("barcode", "patient_id", "sample_type_code") %in% colnames(rna_meta)))
+stopifnot(all(rna_meta$barcode %in% colnames(rna_se)))
+stopifnot(all(rna_meta$patient_id %in% ocscc_patient_ids))
+
+cat("=== mRNA Data ===\n")
+cat("GDC data release recorded in object:",
+    if (is.null(metadata(rna_se)$data_release)) "not recorded" else metadata(rna_se)$data_release, "\n")
+cat("Genes:", nrow(rna_se), "\n")
+cat("Samples:", ncol(rna_se), "\n")
+cat("  Tumor (01):", sum(rna_meta$sample_type_code == "01"), "\n")
+cat("  Normal (11):", sum(rna_meta$sample_type_code == "11"), "\n")
+
+paired <- rna_meta %>%
+  group_by(patient_id) %>%
+  filter(any(sample_type_code == "01") & any(sample_type_code == "11")) %>%
+  pull(patient_id) %>% unique()
+cat("  Paired (Tumor + Normal) patients:", length(paired), "\n")
+```
+
+
+## 3. miRNA-seq
+
+```{r mirna}
+mirna_counts_file <- proj_path(cfg, "data", "processed", "mirna_ocscc_counts.rds")
+mirna_meta_file   <- proj_path(cfg, "data", "processed", "mirna_metadata_ocscc.rds")
+
+if (all(file.exists(c(mirna_counts_file, mirna_meta_file)))) {
+  note_existing(c(mirna_counts_file, mirna_meta_file))
+  mirna_counts <- readRDS(mirna_counts_file)
+  mirna_meta   <- readRDS(mirna_meta_file)
+} else {
+  query_mirna <- GDCquery(
+    project       = "TCGA-HNSC",
+    data.category = "Transcriptome Profiling",
+    data.type     = "miRNA Expression Quantification"
+  )
+  query_mirna$results[[1]] <- query_mirna$results[[1]] %>%
+    filter(substr(cases, 1, 12) %in% ocscc_patient_ids)
+
+  GDCdownload(query_mirna, directory = gdc_dir)
+  mirna_data <- GDCprepare(query_mirna, directory = gdc_dir)
+
+  # GDC miRNA data is a data.frame; count columns are prefixed "read_count_"
+  read_count_cols <- grep("^read_count_", colnames(mirna_data), value = TRUE)
+  sample_barcodes <- gsub("^read_count_", "", read_count_cols)
+
+  mirna_counts_all <- mirna_data[, read_count_cols]
+  rownames(mirna_counts_all) <- mirna_data$miRNA_ID
+  colnames(mirna_counts_all) <- sample_barcodes
+
+  mirna_meta <- data.frame(
+    barcode          = sample_barcodes,
+    patient_id       = substr(sample_barcodes, 1, 12),
+    sample_type_code = substr(sample_barcodes, 14, 15),
+    stringsAsFactors = FALSE
+  ) %>% filter(patient_id %in% ocscc_patient_ids)
+
+  mirna_counts <- mirna_counts_all[, mirna_meta$barcode]
+
+  saveRDS(mirna_counts, mirna_counts_file)
+  saveRDS(mirna_meta, mirna_meta_file)
+  rm(query_mirna, mirna_data, mirna_counts_all, read_count_cols, sample_barcodes)
+}
+
+stopifnot(all(mirna_meta$barcode %in% colnames(mirna_counts)))
+stopifnot(all(mirna_meta$patient_id %in% ocscc_patient_ids))
+
+cat("=== miRNA Data ===\n")
+cat("miRNAs:", nrow(mirna_counts), "\n")
+cat("Samples:", ncol(mirna_counts), "\n")
+cat("  Tumor (01):", sum(mirna_meta$sample_type_code == "01"), "\n")
+cat("  Normal (11):", sum(mirna_meta$sample_type_code == "11"), "\n")
+```
+
+
+## 4. Somatic mutations (masked MAF)
+
+```{r mutations}
+mut_file <- proj_path(cfg, "data", "processed", "OCSCC_Mutation_Details.txt")
+
+# Loss-of-function classes
+lof_variants <- c("Nonsense_Mutation", "Frame_Shift_Ins", "Frame_Shift_Del", "Splice_Site")
+
+if (file.exists(mut_file)) {
+  note_existing(mut_file)
+} else {
+  query_maf <- GDCquery(
+    project       = "TCGA-HNSC",
+    data.category = "Simple Nucleotide Variation",
+    data.type     = "Masked Somatic Mutation",
+    workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking"
+  )
+  GDCdownload(query_maf, method = "api", directory = gdc_dir)
+  maf_raw <- GDCprepare(query_maf, directory = gdc_dir)
+
+  maf_data <- maf_raw %>%
+    filter(substr(Tumor_Sample_Barcode, 1, 12) %in% ocscc_patient_ids) %>%
+    mutate(
+      Mutation_Type    = ifelse(Variant_Classification %in% lof_variants, "LoF", "Other"),
+      Specific_Variant = Variant_Classification
+    )
+
+  write.table(maf_data, mut_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  rm(query_maf, maf_raw, maf_data)
+}
+
+maf_obj <- read.maf(maf = mut_file, verbose = FALSE)
+stopifnot(all(substr(as.character(getSampleSummary(maf_obj)$Tumor_Sample_Barcode), 1, 12)
+              %in% ocscc_patient_ids))
+
+n_top <- 20
+cat("=== Mutation Data ===\n")
+cat("Samples with mutations:", nrow(getSampleSummary(maf_obj)), "\n")
+cat("Total mutations:", sum(getSampleSummary(maf_obj)$total), "\n")
+cat("\nTop", n_top, "mutated genes:\n")
+print(getGeneSummary(maf_obj)[seq_len(n_top), c("Hugo_Symbol", "MutatedSamples")])
+```
+
+
+## 5. HPV status table (external input)
+
+```{r hpv_check}
+hpv_file <- proj_path(cfg, "data", "external", "HPV_summary_TCGA2015NatureSupp1_2.txt")
+
+if (!file.exists(hpv_file)) {
+  stop("HPV table not found at ", hpv_file,
+       ". Download it from the supplementary information of the TCGA HNSC ",
+       "publication (see README, External data).", call. = FALSE)
+}
+
+hpv_data <- read.table(hpv_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE) %>%
+  dplyr::rename(patient_id = Barcode) %>%
+  dplyr::select(patient_id, Final_HPV_Status)
+
+hpv_ocscc <- hpv_data %>% filter(patient_id %in% ocscc_patient_ids)
+
+cat("=== HPV Table ===\n")
+cat("Rows in table:", nrow(hpv_data), "\n")
+cat("OCSCC patients matched:", nrow(hpv_ocscc), "of", length(ocscc_patient_ids), "\n")
+print(table(hpv_ocscc$Final_HPV_Status, useNA = "ifany"))
+```
+
+
+```{r cleanup_and_session_info}
+rm(clinical_ocscc, rna_se, rna_meta, mirna_counts, mirna_meta, maf_obj,
+   hpv_data, hpv_ocscc, paired)
+invisible(gc())
+stop_log()
+```
