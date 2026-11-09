@@ -20,9 +20,9 @@ Entry format:
 
 ## [Unreleased]
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-09
 
-Initial public release: Modules 0, 1, 2, 3A and 3B.
+Initial public release.
 
 - Data acquisition from the GDC (TCGA-HNSC), restricted to oral cavity SCC by
   tissue/organ of origin; each layer is downloaded only if its processed output
